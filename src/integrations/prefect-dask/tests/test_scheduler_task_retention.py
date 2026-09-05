@@ -9,26 +9,33 @@ from prefect_dask.client import PrefectDaskClient
 from prefect import flow, task
 
 
-def _count_prefect_tasks_in_scheduler_process(dask_scheduler) -> int:
+def _count_named_prefect_tasks_in_scheduler_process(dask_scheduler, task_names) -> int:
     import gc
 
     gc.collect()
+    names = set(task_names)
     return sum(
         1
         for obj in gc.get_objects()
-        if type(obj).__module__ == "prefect.tasks" and type(obj).__name__ == "Task"
+        if type(obj).__module__ == "prefect.tasks"
+        and type(obj).__name__ == "Task"
+        and getattr(obj, "name", None) in names
     )
 
 
 def test_scheduler_does_not_retain_prefect_tasks():
     with distributed.LocalCluster(dashboard_address=None) as cluster:
         task_runner = DaskTaskRunner(address=cluster.scheduler_address)
+        tracked_task_names = {
+            "scheduler-retention-make-range",
+            "scheduler-retention-identity",
+        }
 
-        @task
+        @task(name="scheduler-retention-make-range")
         def make_range(n: int) -> list[int]:
             return list(range(n))
 
-        @task
+        @task(name="scheduler-retention-identity")
         def identity(x: int) -> int:
             return x
 
@@ -38,12 +45,22 @@ def test_scheduler_does_not_retain_prefect_tasks():
             futures = identity.map(values)
             return [future.result() for future in futures]
 
+        with distributed.Client(cluster) as client:
+            assert (
+                client.run_on_scheduler(
+                    _count_named_prefect_tasks_in_scheduler_process,
+                    tracked_task_names,
+                )
+                == 0
+            )
+
         assert test_flow(10) == list(range(10))
 
         with distributed.Client(cluster) as client:
             for _ in range(20):
                 retained_prefect_tasks = client.run_on_scheduler(
-                    _count_prefect_tasks_in_scheduler_process
+                    _count_named_prefect_tasks_in_scheduler_process,
+                    tracked_task_names,
                 )
                 if retained_prefect_tasks == 0:
                     break
